@@ -223,6 +223,20 @@ def _extract_json_island_raw_ads(html: str) -> Dict[str, dict]:
     return ads_by_id
 
 
+def _as_plain_text(value: Any) -> Optional[str]:
+    """Facebook's Relay snapshot stores `body` as a rich-text wrapper object
+    (`{"text": "...", ...}`), not a plain string — confirmed live: 10 of 68 real ads in
+    one session had `body` as a dict, while `title`/`cta_text`/`link_url` were always
+    plain strings. Unwraps that one known shape; passes through an already-plain string;
+    returns None for anything else instead of guessing."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        text = value.get("text")
+        return text if isinstance(text, str) else None
+    return None
+
+
 def _normalize_raw_ad(raw: dict) -> List[dict]:
     """Map one raw `ad_archive_id` object to 1+ UBORA-shaped ad records — DCO/carousel
     ads carry multiple `snapshot.cards[]`, each becoming its own record (same convention
@@ -251,7 +265,7 @@ def _normalize_raw_ad(raw: dict) -> List[dict]:
             "ended_running": _epoch_to_iso_date(raw.get("end_date")),
             "is_active": raw.get("is_active"),
             "ads_using_creative": raw.get("collation_count") or 1,
-            "body": card.get("body"),
+            "body": _as_plain_text(card.get("body")),
             "headline": card.get("title"),
             "link_text": card.get("title"),
             # `cta` is the stable enum (SHOP_NOW, LEARN_MORE, ...) — never translated.

@@ -150,6 +150,32 @@ _DUPLICATE_WRAPPER = {
 }
 
 
+ES_IMAGE_AD_RICH_TEXT_BODY = {
+    "ad_archive_id": "1000000000000099",
+    "collation_count": 1,
+    "is_active": True,
+    "page_id": "2000000000000099",
+    "page_name": "Marca Ejemplo CO",
+    "start_date": 1786950000,
+    "end_date": None,
+    "publisher_platform": ["FACEBOOK", "INSTAGRAM"],
+    "snapshot": {
+        "page_id": "2000000000000099",
+        "page_name": "Marca Ejemplo CO",
+        # LIVE-CONFIRMED shape (2026-10-18, real session data): 10 of 68 real ads in one
+        # response had `body` as this rich-text wrapper object, not a plain string — the
+        # bug `_as_plain_text` exists to fix. title/cta_text/link_url were always plain
+        # strings in every real ad observed; only `body` has this wrapper.
+        "body": {"text": "Copy real envuelto en objeto, no string plano."},
+        "cta_type": "SHOP_NOW",
+        "cta_text": "Comprar",
+        "title": "Título normal",
+        "link_url": "https://tienda-ejemplo.com.co/producto/999",
+        "original_image_url": "https://scontent.example.fbcdn.net/original99.jpg",
+    },
+}
+
+
 def test_json_island_extracts_structured_fields():
     html = _sjs_html({"a": [ES_IMAGE_AD]})
     ads = m._extract_structured_ads(html)
@@ -167,6 +193,23 @@ def test_json_island_extracts_structured_fields():
     assert a["started_running"] == "2026-08-17"
     assert "FACEBOOK" in a["platforms"] and "INSTAGRAM" in a["platforms"]
     assert a["extraction_method"] == "json_island"
+
+
+def test_rich_text_wrapper_body_is_unwrapped_to_plain_string():
+    html = _sjs_html({"a": [ES_IMAGE_AD_RICH_TEXT_BODY]})
+    ads = m._extract_structured_ads(html)
+    assert len(ads) == 1
+    assert ads[0]["body"] == "Copy real envuelto en objeto, no string plano."
+    assert isinstance(ads[0]["body"], str)
+
+
+def test_as_plain_text_handles_every_shape_without_crashing():
+    assert m._as_plain_text("plain string") == "plain string"
+    assert m._as_plain_text({"text": "wrapped"}) == "wrapped"
+    assert m._as_plain_text({"text": 123}) is None   # malformed: text itself not a string
+    assert m._as_plain_text({}) is None
+    assert m._as_plain_text(None) is None
+    assert m._as_plain_text(42) is None
 
 
 def test_missing_cta_and_title_are_null_never_fabricated():
