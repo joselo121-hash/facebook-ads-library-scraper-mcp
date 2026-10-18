@@ -72,6 +72,16 @@ class CorrelationIdMiddleware:
         started = time.monotonic()
         status_code = 0
 
+        # Inject the (possibly newly-generated) id back into the request headers seen
+        # downstream — otherwise a client that never sent one gets a DIFFERENT id in this
+        # middleware's own log line than whatever the tool later reads via
+        # fastmcp's get_http_headers() (confirmed live: without this, the tool saw
+        # correlation_id=None while this middleware logged a real generated id).
+        downstream_scope = {**scope, "headers": [
+            *[(k, v) for k, v in scope.get("headers", []) if k != b"x-correlation-id"],
+            (b"x-correlation-id", correlation_id.encode()),
+        ]}
+
         async def send_wrapper(message):
             nonlocal status_code
             if message["type"] == "http.response.start":
@@ -81,7 +91,7 @@ class CorrelationIdMiddleware:
             await send(message)
 
         try:
-            await self.app(scope, receive, send_wrapper)
+            await self.app(downstream_scope, receive, send_wrapper)
         except Exception:
             logger.exception("request failed path=%s correlation_id=%s", scope.get("path"), correlation_id)
             raise

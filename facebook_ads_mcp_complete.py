@@ -77,8 +77,33 @@ MAX_WAIT_SECONDS = 30           # hard ceiling on initial hydration wait
 RENDER_RETRIES = 2              # additional attempts after the first, on transient failure
 RETRY_BACKOFF_BASE_SECONDS = 4  # exponential backoff: 4s, 8s, ...
 MAX_CONCURRENT_RENDERS = 2      # each render = one headless Chromium instance
+# Live-confirmed incident (Fase 3 diagnostic, 2026-10-18): the untouched worst case —
+# 3 attempts x up to 90s page_timeout each, plus 4s/8s backoff between them — is ~282s
+# (4.7 min). The HTTP transport's own MCP_REQUEST_TIMEOUT_SECONDS (120s default) sits
+# INSIDE that range, so a slow-but-legitimate retry sequence gets cut mid-flight by the
+# HTTP layer; the MCP client then tries to reconnect, hits this stateless server's 405
+# (no resumability), gives up on the stream WITHOUT rejecting the caller's pending
+# promise, and the caller hangs until its own outer timeout — while this server's
+# render keeps running orphaned in the background regardless (confirmed live: it
+# finished successfully ~20s after the client had already given up). This budget makes
+# the retry loop self-bound comfortably under the HTTP ceiling, so a normal response
+# ALWAYS completes through the ordinary single-request/response path — no retry is ever
+# started that the loop cannot also finish inside this budget. Fixes the coordination
+# gap; deliberately does not touch MCP_REQUEST_TIMEOUT_SECONDS or any client timeout.
+MAX_TOTAL_RENDER_SECONDS = 100
 
 _render_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RENDERS)
+
+
+def _correlation_id() -> Optional[str]:
+    """Reads the HTTP layer's X-Correlation-Id (set by security_http.py) so internal
+    per-stage logs can be tied to the same id as the request-level log line — None
+    under STDIO, where there is no HTTP request to read it from."""
+    try:
+        from fastmcp.server.dependencies import get_http_headers
+        return get_http_headers().get("x-correlation-id")
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------------
@@ -131,20 +156,46 @@ async def _render_ad_library(url: str, wait_seconds: int = 8, scroll_rounds: int
         magic=True,
     )
 
+    cid = _correlation_id()
+    t_loop_start = time.monotonic()
+    page_timeout_seconds = cfg.page_timeout / 1000
     last_error: Optional[str] = None
+    stages: Dict[str, Any] = {"retry_count": 0, "browser_start_ms": None, "render_ms": None}
+    # Tracks the most recent REAL attempt's outcome, so that stopping early (budget
+    # exhausted) can still return that honest classification — never the generic
+    # NETWORK_ERROR fallback, which would understate a confirmed `likely_blocked`.
+    last_result: Optional[Dict[str, Any]] = None
+
     for attempt in range(RENDER_RETRIES + 1):
+        # Deadline guard (see MAX_TOTAL_RENDER_SECONDS above): never start an attempt
+        # that cannot also FINISH inside the budget — stopping early and returning the
+        # last real outcome is always better than being cut off mid-attempt by the HTTP
+        # layer, which strands the caller instead of giving it a clean answer.
+        elapsed_so_far = time.monotonic() - t_loop_start
+        if attempt > 0 and elapsed_so_far + page_timeout_seconds > MAX_TOTAL_RENDER_SECONDS:
+            logger.warning("render budget exhausted before attempt %d/%d (elapsed=%.1fs, budget=%ds) correlation_id=%s",
+                            attempt + 1, RENDER_RETRIES + 1, elapsed_so_far, MAX_TOTAL_RENDER_SECONDS, cid)
+            if last_result is not None:
+                return last_result
+            break
         async with _render_semaphore:
+            t_browser_start = time.monotonic()
             try:
                 async with AsyncWebCrawler(config=bc) as crawler:
+                    stages["browser_start_ms"] = round((time.monotonic() - t_browser_start) * 1000, 1)
+                    t_render_start = time.monotonic()
                     r = await crawler.arun(url=url, config=cfg)
+                    stages["render_ms"] = round((time.monotonic() - t_render_start) * 1000, 1)
             except Exception as e:  # genuine network/browser failure, not a 403
                 last_error = str(e)
-                logger.warning("render attempt %d/%d raised: %s", attempt + 1, RENDER_RETRIES + 1, last_error)
+                stages["retry_count"] = attempt
+                last_result = {"outcome": RenderOutcome.NETWORK_ERROR, "html": "", "markdown": "",
+                                "status_code": None, "error": last_error, "stages": dict(stages)}
+                logger.warning("render attempt %d/%d raised: %s correlation_id=%s", attempt + 1, RENDER_RETRIES + 1, last_error, cid)
                 if attempt < RENDER_RETRIES:
                     await asyncio.sleep(RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))
                     continue
-                return {"outcome": RenderOutcome.NETWORK_ERROR, "html": "", "markdown": "",
-                        "status_code": None, "error": last_error}
+                return last_result
 
         html = r.html or ""
         md = r.markdown.raw_markdown if hasattr(r.markdown, "raw_markdown") else str(r.markdown or "")
@@ -155,18 +206,25 @@ async def _render_ad_library(url: str, wait_seconds: int = 8, scroll_rounds: int
         # behaviour — hand it to the caller, which decides from parsed content.
         if status_code in (403, 503) and len(html) < 20000:
             last_error = f"HTTP {status_code} with near-empty response ({len(html)} bytes)"
-            logger.warning("render attempt %d/%d looks genuinely blocked: %s", attempt + 1, RENDER_RETRIES + 1, last_error)
+            stages["retry_count"] = attempt
+            last_result = {"outcome": RenderOutcome.LIKELY_BLOCKED, "html": html, "markdown": md,
+                            "status_code": status_code, "error": last_error, "stages": dict(stages)}
+            logger.warning("render attempt %d/%d looks genuinely blocked: %s correlation_id=%s", attempt + 1, RENDER_RETRIES + 1, last_error, cid)
             if attempt < RENDER_RETRIES:
+                elapsed_so_far = time.monotonic() - t_loop_start
+                if elapsed_so_far + RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt) + page_timeout_seconds > MAX_TOTAL_RENDER_SECONDS:
+                    logger.warning("render budget would be exhausted by next retry — stopping now correlation_id=%s", cid)
+                    return last_result
                 await asyncio.sleep(RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))
                 continue
-            return {"outcome": RenderOutcome.LIKELY_BLOCKED, "html": html, "markdown": md,
-                     "status_code": status_code, "error": last_error}
+            return last_result
 
+        stages["retry_count"] = attempt
         return {"outcome": RenderOutcome.OK, "html": html, "markdown": md,
-                 "status_code": status_code, "error": None}
+                 "status_code": status_code, "error": None, "stages": stages}
 
     return {"outcome": RenderOutcome.NETWORK_ERROR, "html": "", "markdown": "",
-             "status_code": None, "error": last_error or "exhausted retries"}
+             "status_code": None, "error": last_error or "render budget exhausted before completing", "stages": stages}
 
 
 # ---------------------------------------------------------------------------------
@@ -504,39 +562,47 @@ def search_ad_library(
         params["q"] = query
     url = AD_LIBRARY_BASE + "?" + "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
 
+    cid = _correlation_id()
     t0 = time.monotonic()
     try:
         rendered = asyncio.run(_render_ad_library(url, wait_seconds, scroll_rounds))
     except Exception as e:
         return {"success": False, "error": str(e), "url": url}
     elapsed = round(time.monotonic() - t0, 1)
+    stages = rendered.get("stages", {})
 
     if rendered["outcome"] == RenderOutcome.NETWORK_ERROR:
-        logger.warning("search_ad_library network_error url=%s elapsed=%.1fs", url, elapsed)
+        logger.warning("search_ad_library network_error url=%s elapsed=%.1fs retry_count=%s correlation_id=%s",
+                       url, elapsed, stages.get("retry_count"), cid)
         return {"success": False, "error_type": "network_error", "error": rendered["error"],
-                "url": url, "elapsed_seconds": elapsed}
+                "url": url, "elapsed_seconds": elapsed, "stages": stages, "correlation_id": cid}
 
     html, md = rendered["html"], rendered["markdown"]
+    t_parse_start = time.monotonic()
     ads = _extract_structured_ads(html)
     extraction_method = "json_island"
     if not ads:
         # Fallback path (§1) — only reached if the primary extractor found nothing.
         ads = _parse_ad_library_markdown_fallback(md)
         extraction_method = "markdown_fallback" if ads else "none"
+    stages["parse_ms"] = round((time.monotonic() - t_parse_start) * 1000, 1)
 
     status, reason = _classify_content(html, md, ads)
-    logger.info("search_ad_library status=%s ads=%d elapsed=%.1fs country=%s extraction=%s",
-                status, len(ads), elapsed, country, extraction_method)
+    logger.info("search_ad_library status=%s ads=%d elapsed=%.1fs country=%s extraction=%s "
+                "browser_start_ms=%s render_ms=%s parse_ms=%s retry_count=%s correlation_id=%s",
+                status, len(ads), elapsed, country, extraction_method,
+                stages.get("browser_start_ms"), stages.get("render_ms"), stages.get("parse_ms"),
+                stages.get("retry_count"), cid)
 
     if status == "zero_results":
         return {"success": True, "query": query or f"page_id:{advertiser_page_id}", "country": country,
                 "url": url, "total_ads_parsed": 0, "ads": [], "note": reason,
-                "elapsed_seconds": elapsed}
+                "elapsed_seconds": elapsed, "stages": stages, "correlation_id": cid}
 
     if status == "likely_blocked":
         return {"success": False, "error_type": "likely_blocked", "url": url, "note": reason,
                 "status_code": rendered["status_code"], "elapsed_seconds": elapsed,
-                "markdown_preview": md[:1500]}
+                "markdown_preview": md[:1500], "stages": stages, "correlation_id": cid}
 
     advertisers: Dict[str, int] = {}
     for a in ads:
@@ -555,6 +621,8 @@ def search_ad_library(
         "advertisers": dict(sorted(advertisers.items(), key=lambda x: -x[1])),
         "ads": ads,
         "elapsed_seconds": elapsed,
+        "stages": stages,
+        "correlation_id": cid,
     }
 
 

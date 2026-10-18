@@ -180,3 +180,75 @@ two are the live-evidence rows above instead.
 - `advertiser_page_id`'s known unreliability under upstream's old parser turned out to
   be a non-issue with the new JSON-island extraction (confirmed live: 66 real ads from
   one real Page ID) — no special-casing was needed, so none was added.
+
+## 6. Timeout/hang diagnostic + fix (2026-10-18, real incident: "waited 4m, then 10m")
+
+**The real root cause, confirmed live with direct timed reproduction** (not theorized —
+measured): this server's render retry loop could legitimately take up to **~282s** in the
+worst case (3 attempts × ≤90s `page_timeout` each, plus 4s/8s backoff between them) — well
+past any realistic HTTP request-timeout ceiling on the caller's side. When that ceiling
+fires while a retry is genuinely still in progress, the HTTP connection gets cut after
+response headers already went out. The MCP client then tries to reconnect (GET with
+`Last-Event-ID`); this server is intentionally stateless (`stateless_http=True`, no event
+store), so it has nothing to resume and correctly answers `405`. Critically, **the client
+library does not reject the caller's pending `callTool()` promise when that reconnection
+attempt fails** — confirmed by direct instrumented reproduction: a real call hung
+completely silently from the moment the stream broke (5.3s) until the ONLY thing that
+ever rescued it — the caller's own explicit `timeout` option — fired at exactly 600.1s
+(10 minutes, the value used in the reproduction). Nothing else in the stack would have
+rescued it sooner. This is a very close, direct match for the reported "waited 4m, then
+10m on the retry" — not the work itself taking that long, but a hang with only the outer
+timeout able to end it. Meanwhile, this server's own render task is **not** cancelled when
+the HTTP layer gives up — confirmed live: a cut-off search still completed successfully
+~20s later, invisible to the client that had already given up, burning Chromium/CPU for
+nobody.
+
+**Fix — `MAX_TOTAL_RENDER_SECONDS = 100`** (`facebook_ads_mcp_complete.py`): the retry loop
+now tracks real elapsed time across all attempts and refuses to start (or back off into) a
+retry that cannot also *finish* inside this budget — it returns the last real
+classification (`ok`/`likely_blocked`/`network_error`) instead. This keeps a normal
+response — even one that needed a retry — comfortably inside the HTTP layer's
+`MCP_REQUEST_TIMEOUT_SECONDS` (120s default), so the mid-stream-cut scenario described
+above is no longer reachable under realistic settings. **Deliberately does not change
+`MCP_REQUEST_TIMEOUT_SECONDS` or any client-side timeout** — this closes the coordination
+gap between the two, rather than trading one blind timeout increase for another.
+
+**Known residual limitation, not solved by this fix** (flagged honestly, not papered
+over): if a single attempt alone — or any other cause — still exceeds whatever HTTP
+timeout is configured, the same hang-until-caller's-own-timeout behavior can still occur,
+because real SSE resumability (an event store + session persistence) is not implemented
+and is a materially bigger change than this incident justified on its own. A caller
+talking to this provider must always set an explicit, bounded `callTool` timeout — UBORA's
+own `MetaAdLibraryScraperProvider` already does (150s), independent of this fix.
+
+**Stage timing + correlation id** (`_render_ad_library`, `search_ad_library`,
+`security_http.py`'s `CorrelationIdMiddleware`): every response now carries a `stages`
+object (`browser_start_ms`, `render_ms`, `parse_ms`, `retry_count`) and a `correlation_id`
+that matches the SAME id the HTTP layer logs for that request — confirmed live, the
+tool-level log line and the HTTP-layer completion log line now share one id end-to-end.
+`get_http_headers()` (FastMCP) reads it; `CorrelationIdMiddleware` now injects a
+newly-generated id back into the downstream request scope so a client that never sent one
+still gets a single consistent id across every log line (a real gap found and fixed during
+this same investigation — the first version only fixed the HTTP-layer log, not the tool's).
+Honest limitation: crawl4ai's `arun()` is a single call covering page-load, hydration
+*and* scroll together — `render_ms` cannot be split into separate `META_LOAD_MS`/
+`SCROLL_MS` without deeper crawl4ai-internal hooks, which this fix does not add.
+
+**Live evidence** (real server, real HTTP, real Chromium renders — not mocked):
+
+| Check | Result |
+|---|---|
+| Reproduced the hang directly, with timing | Stream broke at 5.3s; call stayed pending with zero further activity; rejected only at 600.1s by the caller's own explicit timeout |
+| Confirmed the server-side render is not cancelled by the HTTP cut | A cut-off search still completed successfully ~20s later, server-side only |
+| Real search after the fix, default settings, no retry needed | 68 real ads, resolved cleanly at 26.98s, `stages={"retry_count":0,"browser_start_ms":900.5,"render_ms":25170.3,"parse_ms":24.1}` |
+| Correlation id shared across HTTP-layer log, tool-level log, and the response sent to the caller | Confirmed identical id (`d1d3f9cb...`) in all three, same request |
+| Deadline guard skips a retry it cannot finish in budget | Covered by `tests/test_render_budget.py` (deterministic, mocked clock — no real 90s wait) |
+| Offline suite after all of the above | 37/37 pass |
+
+**Not implemented, explicitly out of scope for this fix** (would need separate
+authorization): real SSE resumability; disabling the MCP client's reconnection outright
+(would not fix the actual hang — confirmed by reading the SDK's own reconnection-exhausted
+code path, which never rejects the pending request either way — only makes the dead-end
+arrive ~1ms faster); a warm Chromium/browser-context pool to cut the ~0.5-0.9s per-call
+`browser_start_ms` cold-start cost (real, confirmed, but small relative to `render_ms` —
+25.2s vs 0.9s in the measurement above — so not the dominant cost and not pursued here).
