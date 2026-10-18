@@ -408,6 +408,38 @@ def test_markdown_fallback_empty_input():
     assert m._parse_ad_library_markdown_fallback("") == []
 
 
+def test_search_ad_library_builds_real_confirmed_url_params(monkeypatch):
+    """Fase 6 (paridad funcional): exact_phrase/platforms/sort_recent were added after
+    live-confirming each real param against facebook.com/ads/library/ directly (not the
+    scraper) — this test only guards that search_ad_library actually builds the URL this
+    way, not that Facebook honors it (that's the live evidence in the Fase 6 report)."""
+    captured_urls = []
+
+    async def fake_render(url, wait_seconds, scroll_rounds):
+        captured_urls.append(url)
+        return {"outcome": m.RenderOutcome.OK, "html": "<html></html>", "markdown": "",
+                "status_code": 200, "error": None, "stages": {"retry_count": 0}}
+
+    monkeypatch.setattr(m, "_render_ad_library", fake_render)
+    monkeypatch.setattr(m, "_extract_structured_ads", lambda html: [])
+    monkeypatch.setattr(m, "_classify_content", lambda html, md, ads: ("zero_results", "test"))
+
+    m.search_ad_library(query="zapatos", country="CO", exact_phrase=True, scroll_rounds=0)
+    assert "search_type=keyword_exact_phrase" in captured_urls[-1]
+
+    m.search_ad_library(query="zapatos", country="CO", platforms="instagram,facebook", scroll_rounds=0)
+    assert "publisher_platforms%5B0%5D=instagram" in captured_urls[-1] or "publisher_platforms[0]=instagram" in captured_urls[-1]
+    assert "publisher_platforms%5B1%5D=facebook" in captured_urls[-1] or "publisher_platforms[1]=facebook" in captured_urls[-1]
+
+    m.search_ad_library(query="zapatos", country="CO", sort_recent=True, scroll_rounds=0)
+    assert "sort_data" in captured_urls[-1] and "relevancy_monthly_grouped" in captured_urls[-1]
+
+    m.search_ad_library(query="zapatos", country="CO", scroll_rounds=0)
+    assert "search_type=keyword_unordered" in captured_urls[-1]
+    assert "publisher_platforms" not in captured_urls[-1]
+    assert "sort_data" not in captured_urls[-1]
+
+
 def test_only_scraping_tools_are_registered():
     # The server is a pure Ad Library scraper — no ads_archive API tools.
     assert hasattr(m, "search_ad_library")

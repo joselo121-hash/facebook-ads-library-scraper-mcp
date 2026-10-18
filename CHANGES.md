@@ -252,3 +252,54 @@ code path, which never rejects the pending request either way — only makes the
 arrive ~1ms faster); a warm Chromium/browser-context pool to cut the ~0.5-0.9s per-call
 `browser_start_ms` cold-start cost (real, confirmed, but small relative to `render_ms` —
 25.2s vs 0.9s in the measurement above — so not the dominant cost and not pursued here).
+
+## 7. Functional parity with the public Ad Library UI (2026-10-18)
+
+New `search_ad_library` parameters, each added only after confirming the real param
+*against facebook.com/ads/library/ directly* (via its own Filters panel, reading the URL
+it produces) — never guessed from the official Graph API's field names, which use a
+different scheme entirely:
+
+- `exact_phrase: bool` → `search_type=keyword_exact_phrase`. Live-confirmed real: the
+  same query/country with `keyword_unordered` vs `keyword_exact_phrase` returned
+  **~740 vs ~140** results (the site's own "~N resultados" counter) — a genuine,
+  substantial difference, not a no-op. No UI control on the real site exposes this
+  (it's keyboard/URL only), but the server honors it.
+- `platforms: str` (comma-separated) → `publisher_platforms[N]=<value>`. Live-confirmed
+  real the same way: selecting "Instagram" in the real site's own Filters panel and
+  clicking "Aplicar" produced exactly `publisher_platforms[0]=instagram` in the
+  resulting URL. Real option set confirmed from the site itself: facebook, instagram,
+  audience_network, messenger, whatsapp, threads.
+- `sort_recent: bool` → `sort_data[mode]=relevancy_monthly_grouped&sort_data[direction]=desc`.
+  Live-confirmed as the real value behind the site's own "Más recientes" sort option.
+  The site's *default* sort is `total_impressions` — deliberately never used here, since
+  reliable impression data doesn't exist for commercial ads outside EU/UK (the entire
+  reason this provider exists). Omitting `sort_recent` leaves the site's own default
+  ordering, which only affects the ORDER ads come back in, not which ads are included.
+
+**Investigated and found NOT real, honestly**: a date-range filter exists in the real
+site's Filters panel ("Impresiones por fecha" — despite the label, applies to a start/
+end delivery-date range, not an impressions chart), but live-confirmed that applying it
+through the real UI **never added any parameter to the shareable URL**, unlike every
+other filter tested — meaning it's driven by an internal request this URL-based scraper
+has no way to replicate without a fundamentally different (full page-interaction)
+scraping approach. Not implemented; documented as unsupported rather than guessed at.
+
+**Correction to §1's earlier MEME verdict**: a cleaner, controlled comparison against
+the real site's own result counter (same query, same every other param) found MEME
+*does* genuinely filter — ALL=740, IMAGE=2, VIDEO=570, MEME=14, NONE=0 for one real
+query. The earlier conclusion (MEME looked like a no-op) came from comparing the
+*scraper's own first-page parsed card count* (`scroll_rounds=0`), which stays roughly
+the same regardless of the real total because the SPA always renders a similar first
+batch before any scrolling — not a reliable signal for whether a filter is real. The
+site's own "~N resultados" counter is the correct, authoritative signal, used throughout
+this section.
+
+**Tests**: `tests/test_parser.py::test_search_ad_library_builds_real_confirmed_url_params`
+(offline, mocks the render step) confirms the URL-building logic for all three new
+parameters, plus confirms none of the three new params appear in the URL when omitted
+(no accidental behavior change for existing callers). Live re-verified end to end
+through the actual tool afterward (not just the raw site): all three params route
+through cleanly with real ads still extracted — the *filtering effect* itself is the
+site-level evidence above, since a `scroll_rounds=0` scrape only ever returns a first
+page regardless of the real total (same reason the original MEME test was unreliable).

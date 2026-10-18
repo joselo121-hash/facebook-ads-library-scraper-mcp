@@ -524,6 +524,9 @@ def search_ad_library(
     media_type: str = "all",
     ad_type: str = "all",
     advertiser_page_id: str = "",
+    exact_phrase: bool = False,
+    platforms: str = "",
+    sort_recent: bool = False,
     wait_seconds: int = 8,
     scroll_rounds: int = 8,
 ) -> dict:
@@ -534,10 +537,24 @@ def search_ad_library(
         country: ISO country code the ads were delivered in (MX, US, ES, CO, ...)
         active_status: active | inactive | all
         ad_type: all | political_and_issue_ads | employment_ads | housing_ads | financial_products_and_services_ads
-        media_type: all | image | meme | video | none
+        media_type: all | image | meme | video | none — all 5 confirmed real on the real
+               public site (not just accepted-but-ignored): a clean count comparison for the
+               same query showed ALL=740, IMAGE=2, VIDEO=570, MEME=14, NONE=0 real results.
         advertiser_page_id: if set, target that Page's "all ads" view instead of a keyword
                search. This view is heavier client-rendered and does not always hydrate
                headless — a keyword search of the advertiser's name is the more reliable path.
+        exact_phrase: live-confirmed real (not a client-side filter): the same query with
+               `search_type=keyword_exact_phrase` returns a genuinely narrower result set
+               (confirmed live: 740 broad vs 140 exact for the same query/country) — the
+               public site honors this server-side even though no UI control exposes it.
+               Ignored when advertiser_page_id is set (that path always uses search_type=page).
+        platforms: comma-separated subset of facebook,instagram,audience_network,messenger,
+               whatsapp,threads — live-confirmed real via `publisher_platforms[]`, discovered
+               by using the real site's own Filters panel and reading the URL it produced.
+        sort_recent: live-confirmed real via `sort_data[mode]=relevancy_monthly_grouped`
+               (the real site's own "Más recientes"/"Most recent" option — the only other
+               real sort mode is impressions-based, deliberately never used here since
+               reliable impression data doesn't exist for commercial ads outside EU/UK).
         wait_seconds: how long to let the SPA hydrate before scraping (raise if results are
                empty). Capped at 30s.
         scroll_rounds: infinite-scroll cycles to load more ads past the first ~24
@@ -546,21 +563,26 @@ def search_ad_library(
     if not query and not advertiser_page_id:
         return {"success": False, "error": "Pass either query or advertiser_page_id."}
 
-    params = {
-        "active_status": active_status,
-        "ad_type": ad_type,
-        "country": country,
-        "media_type": media_type,
-    }
+    params: List[Tuple[str, str]] = [
+        ("active_status", active_status),
+        ("ad_type", ad_type),
+        ("country", country),
+        ("media_type", media_type),
+    ]
     if advertiser_page_id:
-        params["view_all_page_id"] = advertiser_page_id
-        params["search_type"] = "page"
+        params.append(("view_all_page_id", advertiser_page_id))
+        params.append(("search_type", "page"))
         if query:
-            params["q"] = query
+            params.append(("q", query))
     else:
-        params["search_type"] = "keyword_unordered"
-        params["q"] = query
-    url = AD_LIBRARY_BASE + "?" + "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+        params.append(("search_type", "keyword_exact_phrase" if exact_phrase else "keyword_unordered"))
+        params.append(("q", query))
+    for i, platform in enumerate(p.strip().lower() for p in platforms.split(",") if p.strip()):
+        params.append((f"publisher_platforms[{i}]", platform))
+    if sort_recent:
+        params.append(("sort_data[mode]", "relevancy_monthly_grouped"))
+        params.append(("sort_data[direction]", "desc"))
+    url = AD_LIBRARY_BASE + "?" + "&".join(f"{quote(k)}={quote(str(v))}" for k, v in params)
 
     cid = _correlation_id()
     t0 = time.monotonic()
