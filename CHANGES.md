@@ -344,3 +344,30 @@ sent raw, and neither param appears when omitted entirely. 39/39 fork tests pass
 Live-verified twice through the running MCP server (not just facebook.com directly):
 the 2020 window returned 0 ads, and the narrow 2026 window returned real ads with real
 (out-of-window) start dates, consistent with the delivery-window semantics above.
+
+## 9. Language filter + advertiser page-id refinement (`language`, `page_ids`, 2026-10-18)
+
+Cierre local definitivo: two more filters investigated live in §7's follow-up audit, now
+implemented.
+
+**`language`**: the real site's own Idioma control is a *bounded dropdown*, not free
+text — for a CO commercial query it only ever offered "Todos los idiomas" and "Español".
+Selecting Español and applying added `content_languages[0]=es` to the real URL.
+`search_ad_library` now accepts `language="es"` (anything else is silently dropped —
+never invent support for a language the real dropdown was never observed to offer).
+
+**`page_ids`**: the real site's "Anunciante" control is **not** a free-text/global page
+search. It's a dropdown populated only with advertisers already present in the current
+query's own results, and every option already carries a real, resolved numeric Page ID
+— selecting one and applying added `page_ids[0]=1292787447248761` to the real URL for
+"Blinkdrama-Shel". This is a genuinely different mechanism from the existing
+`advertiser_page_id` (which replaces the keyword search entirely with that page's full
+"all ads" view, `search_type=page`): `page_ids` instead *refines* a keyword search down
+to one or more pages, same way the real UI does it. `search_ad_library` now accepts a
+comma-separated `page_ids` string, applied only on the keyword-search path (ignored when
+`advertiser_page_id` is set, since that path has no keyword search left to refine).
+
+**Tests**: `tests/test_parser.py::test_search_ad_library_language_filter` and
+`::test_search_ad_library_page_ids_refinement` (offline, mock the render step) — real
+param names/values, multi-id lists, the `fr` (unconfirmed language) no-op case, and the
+`page_ids` ignored-under-`advertiser_page_id` case. 41/41 fork tests pass.

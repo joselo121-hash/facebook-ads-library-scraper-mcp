@@ -530,6 +530,8 @@ def search_ad_library(
     sort_recent: bool = False,
     delivery_date_min: str = "",
     delivery_date_max: str = "",
+    language: str = "",
+    page_ids: str = "",
     wait_seconds: int = 8,
     scroll_rounds: int = 8,
 ) -> dict:
@@ -573,6 +575,20 @@ def search_ad_library(
                a valid YYYY-MM-DD string.
         delivery_date_max: ISO date (YYYY-MM-DD), optional. Paired with delivery_date_min;
                either may be passed alone.
+        language: live-confirmed real via `content_languages[0]`, discovered from the real
+               site's own Filters panel — a bounded dropdown, not free text. Only "es" is
+               confirmed real for a commercial Colombia query (the dropdown itself only
+               offered "Todos los idiomas" and "Español" for that query/country); pass "es"
+               for Spanish or leave empty for all languages. Do not pass any other value —
+               it has not been confirmed live and would silently do nothing real.
+        page_ids: comma-separated real numeric Page IDs, live-confirmed real via `page_ids[]`
+               — discovered from the real site's own "Anunciante" filter, which is NOT a
+               free-text/global page search: it is a dropdown populated only with advertisers
+               already present in the current query's own results, each option already
+               carrying its real resolved Page ID. This refines a keyword search to only
+               those pages (distinct from advertiser_page_id above, which instead replaces
+               the keyword search entirely with a page's full "all ads" view). Ignored when
+               advertiser_page_id is set.
         wait_seconds: how long to let the SPA hydrate before scraping (raise if results are
                empty). Capped at 30s.
         scroll_rounds: infinite-scroll cycles to load more ads past the first ~24
@@ -595,6 +611,8 @@ def search_ad_library(
     else:
         params.append(("search_type", "keyword_exact_phrase" if exact_phrase else "keyword_unordered"))
         params.append(("q", query))
+        for i, pid in enumerate(p.strip() for p in page_ids.split(",") if p.strip()):
+            params.append((f"page_ids[{i}]", pid))
     for i, platform in enumerate(p.strip().lower() for p in platforms.split(",") if p.strip()):
         params.append((f"publisher_platforms[{i}]", platform))
     if sort_recent:
@@ -604,6 +622,11 @@ def search_ad_library(
         params.append(("start_date[min]", delivery_date_min))
     if delivery_date_max and _ISO_DATE_RE.match(delivery_date_max):
         params.append(("start_date[max]", delivery_date_max))
+    # Only "es" is live-confirmed real for this provider's commercial-Colombia use case —
+    # the real dropdown itself only offered two options for the control query. Never pass
+    # through an unconfirmed language code; silently drop anything else.
+    if language.strip().lower() == "es":
+        params.append(("content_languages[0]", "es"))
     url = AD_LIBRARY_BASE + "?" + "&".join(f"{quote(k)}={quote(str(v))}" for k, v in params)
 
     cid = _correlation_id()

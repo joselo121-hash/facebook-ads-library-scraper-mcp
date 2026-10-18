@@ -481,6 +481,67 @@ def test_search_ad_library_delivery_date_range_params(monkeypatch):
     assert "start_date" not in captured_urls[-1]
 
 
+def test_search_ad_library_language_filter(monkeypatch):
+    """Cierre local definitivo (2026-10-18): the real site's own Idioma dropdown is
+    bounded (only "Todos los idiomas"/"Español" observed for a CO commercial query),
+    and live-confirmed to append content_languages[0]=es to the URL. Only "es" is
+    passed through — never invent support for a language never actually seen on the
+    real dropdown."""
+    captured_urls = []
+
+    async def fake_render(url, wait_seconds, scroll_rounds):
+        captured_urls.append(url)
+        return {"outcome": m.RenderOutcome.OK, "html": "<html></html>", "markdown": "",
+                "status_code": 200, "error": None, "stages": {"retry_count": 0}}
+
+    monkeypatch.setattr(m, "_render_ad_library", fake_render)
+    monkeypatch.setattr(m, "_extract_structured_ads", lambda html: [])
+    monkeypatch.setattr(m, "_classify_content", lambda html, md, ads: ("zero_results", "test"))
+
+    m.search_ad_library(query="zapatos", country="CO", language="es", scroll_rounds=0)
+    assert "content_languages%5B0%5D=es" in captured_urls[-1] or "content_languages[0]=es" in captured_urls[-1]
+
+    m.search_ad_library(query="zapatos", country="CO", language="fr", scroll_rounds=0)
+    assert "content_languages" not in captured_urls[-1]
+
+    m.search_ad_library(query="zapatos", country="CO", scroll_rounds=0)
+    assert "content_languages" not in captured_urls[-1]
+
+
+def test_search_ad_library_page_ids_refinement(monkeypatch):
+    """Cierre local definitivo (2026-10-18): the real site's "Anunciante" filter is not
+    a free-text/global page search — it's a dropdown populated only from advertisers
+    already present in the current query's results, each option carrying a real,
+    already-resolved Page ID. Confirmed live: selecting one appended page_ids[0]=<real
+    numeric id> to the URL. This refines a keyword search (distinct from
+    advertiser_page_id, which replaces the keyword search with a page's full view)."""
+    captured_urls = []
+
+    async def fake_render(url, wait_seconds, scroll_rounds):
+        captured_urls.append(url)
+        return {"outcome": m.RenderOutcome.OK, "html": "<html></html>", "markdown": "",
+                "status_code": 200, "error": None, "stages": {"retry_count": 0}}
+
+    monkeypatch.setattr(m, "_render_ad_library", fake_render)
+    monkeypatch.setattr(m, "_extract_structured_ads", lambda html: [])
+    monkeypatch.setattr(m, "_classify_content", lambda html, md, ads: ("zero_results", "test"))
+
+    m.search_ad_library(query="zapatos", country="CO", page_ids="1292787447248761", scroll_rounds=0)
+    assert "page_ids%5B0%5D=1292787447248761" in captured_urls[-1] or "page_ids[0]=1292787447248761" in captured_urls[-1]
+
+    m.search_ad_library(query="zapatos", country="CO", page_ids="111,222", scroll_rounds=0)
+    assert ("page_ids%5B0%5D=111" in captured_urls[-1] or "page_ids[0]=111" in captured_urls[-1])
+    assert ("page_ids%5B1%5D=222" in captured_urls[-1] or "page_ids[1]=222" in captured_urls[-1])
+
+    # page_ids is ignored on the advertiser_page_id (full page-view) path — that path
+    # already means "every ad from this one page," a page_ids refinement is meaningless there.
+    m.search_ad_library(advertiser_page_id="999", page_ids="111", scroll_rounds=0)
+    assert "page_ids" not in captured_urls[-1]
+
+    m.search_ad_library(query="zapatos", country="CO", scroll_rounds=0)
+    assert "page_ids" not in captured_urls[-1]
+
+
 def test_only_scraping_tools_are_registered():
     # The server is a pure Ad Library scraper — no ads_archive API tools.
     assert hasattr(m, "search_ad_library")
