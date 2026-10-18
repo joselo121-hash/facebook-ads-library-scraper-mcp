@@ -38,6 +38,7 @@ Tools (unchanged contract):
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,7 +47,16 @@ from urllib.parse import quote, urlparse, parse_qs, unquote
 from fastmcp import FastMCP
 from crawl4ai import AsyncWebCrawler
 
+from security_http import SharedSecretVerifier, required_env
+
 logger = logging.getLogger("facebook_ads_mcp")
+
+# Decided here (not inside __main__) because FastMCP's auth provider is a constructor
+# argument, not a run() argument. STDIO (local dev) never needs MCP_SHARED_SECRET — the
+# env var is only required for the streamable-http path, checked lazily so existing
+# STDIO users are never forced to set anything new.
+_MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
+_http_auth = SharedSecretVerifier(required_env("MCP_SHARED_SECRET")) if _MCP_TRANSPORT != "stdio" else None
 
 mcp = FastMCP(
     name="Facebook Ad Library",
@@ -56,6 +66,7 @@ mcp = FastMCP(
     cards: advertiser, run date, creative count, landing domain, CTA, headline and body
     copy, plus image/video URLs when the ad has them.
     """,
+    auth=_http_auth,
 )
 
 AD_LIBRARY_BASE = "https://www.facebook.com/ads/library/"
@@ -581,6 +592,55 @@ def scrape_ad_library_url(url: str, wait_seconds: int = 8, scroll_rounds: int = 
     }
 
 
+@mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+async def _healthz(request):
+    from security_http import health
+    return await health(request)
+
+
+@mcp.custom_route("/readyz", methods=["GET"], include_in_schema=False)
+async def _readyz(request):
+    from security_http import readiness
+    return await readiness(request)
+
+
 if __name__ == "__main__":
     print("Facebook Ad Library MCP (UBORA fork) — scraping tools: search_ad_library, scrape_ad_library_url")
-    mcp.run(transport="stdio")
+    if _MCP_TRANSPORT == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        from starlette.middleware import Middleware
+        from security_http import (
+            CorrelationIdMiddleware, MaxBodySizeMiddleware, ConcurrencyLimitMiddleware,
+            RateLimitMiddleware, RequestTimeoutMiddleware, env_int,
+        )
+
+        max_body_bytes = env_int("MCP_MAX_BODY_BYTES", 65_536)
+        max_concurrent = env_int("MCP_MAX_CONCURRENT_HTTP_REQUESTS", 4)
+        max_per_minute = env_int("MCP_RATE_LIMIT_PER_MINUTE", 60)
+        request_timeout_seconds = env_int("MCP_REQUEST_TIMEOUT_SECONDS", 120)
+        allowed_hosts_raw = os.environ.get("MCP_ALLOWED_HOSTS")
+        allowed_hosts = [h.strip() for h in allowed_hosts_raw.split(",") if h.strip()] if allowed_hosts_raw else None
+
+        print(f"HTTP transport: host={os.environ.get('MCP_HTTP_HOST', '127.0.0.1')} "
+              f"port={env_int('MCP_HTTP_PORT', 8800)} path={os.environ.get('MCP_HTTP_PATH', '/mcp')} "
+              f"max_concurrent={max_concurrent} max_per_minute={max_per_minute} "
+              f"request_timeout_s={request_timeout_seconds} max_body_bytes={max_body_bytes}")
+
+        mcp.run(
+            transport="streamable-http",
+            host=os.environ.get("MCP_HTTP_HOST", "127.0.0.1"),
+            port=env_int("MCP_HTTP_PORT", 8800),
+            path=os.environ.get("MCP_HTTP_PATH", "/mcp"),
+            stateless_http=True,
+            allowed_hosts=allowed_hosts,
+            middleware=[
+                # Order matters: outermost (first) runs first on the way in, last on the way out.
+                Middleware(CorrelationIdMiddleware),
+                Middleware(RequestTimeoutMiddleware, timeout_seconds=float(request_timeout_seconds)),
+                Middleware(MaxBodySizeMiddleware, max_bytes=max_body_bytes),
+                Middleware(RateLimitMiddleware, max_requests_per_minute=max_per_minute),
+                Middleware(ConcurrencyLimitMiddleware, max_concurrent=max_concurrent),
+            ],
+        )

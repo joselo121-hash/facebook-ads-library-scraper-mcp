@@ -96,14 +96,87 @@ dedupe path, the English-schema equivalent (language-independence test), and the
 English-markdown fixture and its tests are kept, renamed to match the new fallback
 function name.
 
+## 5. Streamable HTTP transport + service security (`security_http.py`, new)
+
+**Why**: UBORA's owner decided `PROVIDER_HOSTING=SELF_HOSTED` /
+`PROVIDER_TRANSPORT=STREAMABLE_HTTP` — STDIO stays for local dev only, never for the
+UBORA integration (a shared STDIO subprocess has no per-request security boundary).
+UBORA's Next.js backend already talks to one other MCP server over real streamable
+HTTP (`src/server/external-integrations/mcp-client.ts`, `StreamableHTTPClientTransport`
+from `@modelcontextprotocol/client` against `https://mcp.facebook.com/ads`) — this
+fork now speaks the same real MCP-over-HTTP protocol, so UBORA's side can reuse that
+exact client pattern instead of inventing a bespoke REST shape.
+
+**What changed**:
+
+- `mcp.run(transport="streamable-http", ...)` — FastMCP 4.1.1's native transport, not a
+  hand-rolled HTTP layer (confirmed it supports this cleanly before writing anything —
+  see live test evidence below). Selected via `MCP_TRANSPORT=streamable-http`; default
+  stays `stdio`, so existing local-dev usage needs zero new env vars.
+- `SharedSecretVerifier` (`security_http.py`) — a minimal `fastmcp.TokenVerifier`: one
+  server-side-only bearer secret (`MCP_SHARED_SECRET`, required + rejected if under 16
+  chars), constant-time compared (`hmac.compare_digest`), no OAuth machinery, no
+  end-user identity — tenancy is UBORA's job, not this scraper's.
+- `/healthz`, `/readyz` (`@mcp.custom_route`, confirmed unauthenticated by FastMCP's own
+  design — `RequireAuthMiddleware` only wraps the `/mcp` route, not custom routes).
+  Readiness is deliberately shallow (process-is-up only) — it never launches Chromium
+  or hits facebook.com, so a health-check interval can't itself hammer the Ad Library.
+- `CorrelationIdMiddleware`, `ConcurrencyLimitMiddleware`, `RequestTimeoutMiddleware` —
+  written as **raw ASGI middleware**, not Starlette's `BaseHTTPMiddleware`. Live testing
+  caught a real bug in an earlier `BaseHTTPMiddleware` version: for this server's SSE
+  tool-call responses, `call_next()` returns as soon as response headers are ready, not
+  when the streamed body (the actual scrape result) finishes — a 27s real tool call
+  logged `elapsed_ms=624`, and a concurrency slot would have been released ~27s early.
+  Rewritten as plain ASGI classes wrapping `send`/wrapping the whole `self.app(...)`
+  call, which only returns after the full stream completes — re-tested live, now
+  correct (see evidence below).
+- `MaxBodySizeMiddleware` (`MCP_MAX_BODY_BYTES`, default 64KB) and `RateLimitMiddleware`
+  (`MCP_RATE_LIMIT_PER_MINUTE`, default 60) — ordinary `BaseHTTPMiddleware` is correct
+  here, since both act on the request only, before the response starts.
+- `RequestTimeoutMiddleware` ceiling (`MCP_REQUEST_TIMEOUT_SECONDS`, default 120s): if
+  the timeout fires before any response bytes went out, it returns a clean 504; if
+  headers were already sent (confirmed the common case for a real multi-second scrape —
+  SSE sends `200` + headers immediately, before the result event), it re-raises and the
+  connection is cut instead of sending a malformed response. **UBORA's client-side
+  provider must treat an aborted/reset stream as `PROVIDER_TIMEOUT`, not just a clean
+  504** — this is the realistic failure shape, confirmed live, not the rarer clean-504
+  one.
+- `ConcurrencyLimitMiddleware` (`MCP_MAX_CONCURRENT_HTTP_REQUESTS`, default 4) guards the
+  HTTP layer itself and is independent of the pre-existing `MAX_CONCURRENT_RENDERS`
+  semaphore (§3), which only caps concurrent Chromium instances.
+- `MCP_HTTP_HOST` / `MCP_HTTP_PORT` / `MCP_HTTP_PATH` / `MCP_ALLOWED_HOSTS` (passed
+  straight through to FastMCP's own built-in `allowed_hosts` hardening — not
+  reimplemented).
+
+**Live evidence** (real HTTP calls against this process, real Chromium renders against
+the real public Ad Library — not mocked):
+
+| Check | Result |
+|---|---|
+| FastMCP 4.1.1 `streamable-http` transport | Confirmed via `inspect.signature` before coding — `run_http_async` natively supports `host/port/path/middleware/allowed_hosts/stateless_http` |
+| `/healthz`, `/readyz` without auth | 200, 200 (real HTTP) |
+| `/mcp` with no `Authorization` header | 401 (real HTTP) |
+| `/mcp` with wrong bearer token | 401 (real HTTP) |
+| `/mcp` with correct bearer token — real `initialize` + real `tools/call` | 200, real MCP protocol handshake, real `search_ad_library` result (68 structured ads, `country=CO`, query="Nike") |
+| `elapsed_ms` logged vs curl's real wall-clock time | Before fix: `624ms` logged vs `27.4s` real (bug). After fix: `18589.4ms` logged vs `18.59s` real (curl `time_total`) — matches |
+| Concurrency limit (`max_concurrent=1`), 2 real concurrent requests | 2nd request got real `429` at ~1.5s while the 1st (an actual 18.4s scrape) was still running — proves the slot stays held for the real duration, not time-to-first-byte |
+| Rate limit (`max_requests_per_minute=3`), 5 rapid requests | 200, 200, 200, 429, 429 |
+| Oversized body (`MCP_MAX_BODY_BYTES=200`, 500-byte body) | 413 |
+| Request timeout (`MCP_REQUEST_TIMEOUT_SECONDS=5`) against a real ~15-20s scrape | Connection aborted after headers were already sent (curl exit 18, partial transfer) — the "re-raise, cut connection" branch, confirmed live. The "fires before headers sent → clean 504" branch is code-reviewed only, not independently live-reproduced this session (every real scrape call sent headers well before 5s) |
+
+**Tests** (`tests/test_security_http.py`, 10 new, offline): `SharedSecretVerifier`
+accept/reject/short-secret cases, `required_env`/`env_int` helpers, and
+`RateLimitMiddleware`'s window logic via a dummy ASGI app. The concurrency/timeout
+real-completion-timing behaviors are deliberately **not** re-proven with a mocked ASGI
+call in this file — a mock would only test the mock, not real streaming timing; those
+two are the live-evidence rows above instead.
+
 ## What was intentionally NOT changed
 
 - The 2 tool signatures (`search_ad_library`, `scrape_ad_library_url`) — identical
   contract, so a caller (including UBORA's own future gateway) needs no changes beyond
   pointing at this fork.
-- STDIO transport — unchanged; UBORA's own self-host integration plan (how a Next.js
-  backend reaches a STDIO-only MCP server) is a separate, not-yet-decided question, out
-  of scope for this fix.
+- STDIO transport — unchanged, still the default, still zero-config for local dev.
 - `advertiser_page_id`'s known unreliability under upstream's old parser turned out to
   be a non-issue with the new JSON-island extraction (confirmed live: 66 real ads from
   one real Page ID) — no special-casing was needed, so none was added.
