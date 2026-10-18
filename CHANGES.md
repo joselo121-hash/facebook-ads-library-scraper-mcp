@@ -371,3 +371,18 @@ comma-separated `page_ids` string, applied only on the keyword-search path (igno
 `::test_search_ad_library_page_ids_refinement` (offline, mock the render step) — real
 param names/values, multi-id lists, the `fr` (unconfirmed language) no-op case, and the
 `page_ids` ignored-under-`advertiser_page_id` case. 41/41 fork tests pass.
+
+## 10. Dockerfile for self-hosted deployment (2026-10-18)
+
+UBORA's Vercel Preview deploy needs this provider reachable over real HTTPS (Vercel
+serverless Functions can't run a Playwright/Chromium process — researched and confirmed
+in an earlier UBORA session: no Python equivalent of Node's `@sparticuz/chromium`,
+industry guidance against real browsers in serverless functions). Added a `Dockerfile`
+(`python:3.12-slim` + `playwright install --with-deps chromium`, not a pinned
+`mcr.microsoft.com/playwright/python` tag, since `requirements.txt` doesn't pin an exact
+playwright version) for self-hosted deployment (Coolify or equivalent).
+
+Built and smoke-tested locally before anything else: the image starts, `/healthz`
+returns `{"status":"ok"}`, and a real `search_ad_library` call through the running
+container returned 50 real ads from the live Ad Library — not just "the container
+starts," the actual headless-Chromium render path works inside it.

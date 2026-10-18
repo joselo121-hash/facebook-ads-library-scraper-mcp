@@ -1,0 +1,11 @@
+.venv
+__pycache__
+*.pyc
+tests
+.git
+.pytest_cache
+docs
+ROADMAP.md
+CHANGES.md
+README.md
+LICENSE
