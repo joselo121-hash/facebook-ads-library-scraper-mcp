@@ -303,3 +303,44 @@ through the actual tool afterward (not just the raw site): all three params rout
 through cleanly with real ads still extracted — the *filtering effect* itself is the
 site-level evidence above, since a `scroll_rounds=0` scrape only ever returns a first
 page regardless of the real total (same reason the original MEME test was unreliable).
+
+## 8. Correction: date-range filter is real after all (`delivery_date_min`/`delivery_date_max`, 2026-10-18)
+
+§7 above concluded the date-range filter was real but unreplicable because applying it
+through the real site's own Filters UI appeared to add no URL parameter. Re-investigated
+at the request of a final audit, this time checking network traffic (not just the
+address bar) and testing the field pair (Desde **and** Hasta) together instead of one
+field alone. Both corrections were wrong in §7:
+
+- Using the real Filters panel's "Desde" field and pressing "Aplicar" **does** add
+  `start_date[min]=...` to the URL — contradicting §7's "never added any parameter."
+- Navigating directly to a URL carrying `start_date[min]=2026-10-01&start_date[max]=2026-10-05`
+  for an existing query dropped the real site's own authoritative result counter from
+  ~740 to ~140, with the site's own filter chip echoing back the exact range requested.
+
+**A second, independent check caught a semantic trap before shipping it wrong**: the
+~140 ads returned under that filter still showed their own real "En circulación desde"
+start dates — 5 nov. 2025, 26 feb. 2026, 11 ene. 2026 — far outside the requested
+window. Re-running the same narrow window through this fork's own scraper confirmed the
+identical ads/dates. That looked like a broken filter at first. It wasn't: a historical
+window with no plausible live delivery (`2020-01-01`..`2020-01-05`) returned **0 ads**
+through this fork's `search_ad_library`, proving the param genuinely restricts results —
+just not by *start* date. It restricts by **delivery/impression window**: "was this ad
+running at some point during [min, max]" — exactly what the real UI's own label
+("Impresiones por fecha") says, and exactly `ad_delivery_date_min`/`ad_delivery_date_max`
+in the official Graph API's documented field names. A still-active ad that started
+months before the window is, correctly, included — it was delivering during it.
+
+**Implementation**: added `delivery_date_min`/`delivery_date_max` (ISO `YYYY-MM-DD`,
+either optional, validated against a strict regex before being placed on the URL) to
+`search_ad_library`, mapped to the real `start_date[min]`/`start_date[max]` wire
+parameters. Named deliberately differently from Facebook's own wire name so a caller
+can't make the same "start date" mistake §7 almost shipped.
+
+**Tests**: `tests/test_parser.py::test_search_ad_library_delivery_date_range_params`
+(offline, mocks the render step) — both params present when both are set, only `min`
+present when `max` is omitted, an invalid date string is dropped silently rather than
+sent raw, and neither param appears when omitted entirely. 39/39 fork tests pass.
+Live-verified twice through the running MCP server (not just facebook.com directly):
+the 2020 window returned 0 ads, and the narrow 2026 window returned real ads with real
+(out-of-window) start dates, consistent with the delivery-window semantics above.

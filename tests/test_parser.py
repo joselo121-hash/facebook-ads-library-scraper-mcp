@@ -440,6 +440,47 @@ def test_search_ad_library_builds_real_confirmed_url_params(monkeypatch):
     assert "sort_data" not in captured_urls[-1]
 
 
+def test_search_ad_library_delivery_date_range_params(monkeypatch):
+    """Auditoría final (2026-10-18): the Fase 6 report wrongly concluded date-range was
+    UNSUPPORTED because it only checked the browser address bar after using the real
+    site's UI. Re-investigated at the network/URL level: applying "Impresiones por
+    fecha" on facebook.com/ads/library/ really does append start_date[min]/start_date[max]
+    to the URL. Two independent live tests on the real site/scraper proved this is a
+    DELIVERY-window filter ("was this ad running during [min,max]"), not a "when did
+    this ad start" filter: a 2020-01-01..2020-01-05 window against an active-only query
+    returned 0 ads (proves the param is honored), while a real 2026-10-01..2026-10-05
+    window returned ads whose own start dates (e.g. 2025-11-05, 2026-02-26) were well
+    outside that window — because those ads are still active today and were therefore
+    delivering impressions during it. Hence the tool's param names are delivery_date_min/
+    delivery_date_max, not start_date_min/max. This test only guards the URL-building
+    side; the live evidence above is the capability-matrix proof."""
+    captured_urls = []
+
+    async def fake_render(url, wait_seconds, scroll_rounds):
+        captured_urls.append(url)
+        return {"outcome": m.RenderOutcome.OK, "html": "<html></html>", "markdown": "",
+                "status_code": 200, "error": None, "stages": {"retry_count": 0}}
+
+    monkeypatch.setattr(m, "_render_ad_library", fake_render)
+    monkeypatch.setattr(m, "_extract_structured_ads", lambda html: [])
+    monkeypatch.setattr(m, "_classify_content", lambda html, md, ads: ("zero_results", "test"))
+
+    m.search_ad_library(query="zapatos", country="CO", delivery_date_min="2026-10-01",
+                         delivery_date_max="2026-10-05", scroll_rounds=0)
+    assert "start_date%5Bmin%5D=2026-10-01" in captured_urls[-1] or "start_date[min]=2026-10-01" in captured_urls[-1]
+    assert "start_date%5Bmax%5D=2026-10-05" in captured_urls[-1] or "start_date[max]=2026-10-05" in captured_urls[-1]
+
+    m.search_ad_library(query="zapatos", country="CO", delivery_date_min="2026-10-01", scroll_rounds=0)
+    assert "start_date" in captured_urls[-1]
+    assert "max" not in captured_urls[-1]
+
+    m.search_ad_library(query="zapatos", country="CO", delivery_date_min="not-a-date", scroll_rounds=0)
+    assert "start_date" not in captured_urls[-1]
+
+    m.search_ad_library(query="zapatos", country="CO", scroll_rounds=0)
+    assert "start_date" not in captured_urls[-1]
+
+
 def test_only_scraping_tools_are_registered():
     # The server is a pure Ad Library scraper — no ads_archive API tools.
     assert hasattr(m, "search_ad_library")

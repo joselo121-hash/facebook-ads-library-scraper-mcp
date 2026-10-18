@@ -70,6 +70,7 @@ mcp = FastMCP(
 )
 
 AD_LIBRARY_BASE = "https://www.facebook.com/ads/library/"
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # --- Hardening limits (§7) -------------------------------------------------------
 MAX_SCROLL_ROUNDS = 20          # hard ceiling regardless of what the caller passes
@@ -527,6 +528,8 @@ def search_ad_library(
     exact_phrase: bool = False,
     platforms: str = "",
     sort_recent: bool = False,
+    delivery_date_min: str = "",
+    delivery_date_max: str = "",
     wait_seconds: int = 8,
     scroll_rounds: int = 8,
 ) -> dict:
@@ -555,6 +558,21 @@ def search_ad_library(
                (the real site's own "Más recientes"/"Most recent" option — the only other
                real sort mode is impressions-based, deliberately never used here since
                reliable impression data doesn't exist for commercial ads outside EU/UK).
+        delivery_date_min: ISO date (YYYY-MM-DD), optional. Live-confirmed real via the
+               real site's own "Impresiones por fecha" filter (network/URL level, not just
+               the address bar) — sends `start_date[min]`/`start_date[max]`. Confirmed via
+               two independent live tests: (1) a 2020-01-01..2020-01-05 window against an
+               "active" query returned 0 ads — proves it is NOT ignored; (2) every ad
+               returned for a real 2026-10-01..2026-10-05 window still showed its own real
+               start date (e.g. "5 nov. 2025", "26 feb. 2026") well outside that window.
+               Together these prove this filters by delivery/impression window — "was this
+               ad running during [min,max]" — matching the official Graph API's
+               `ad_delivery_date_min`/`ad_delivery_date_max` semantics, the same answer the
+               real UI's own label ("Impresiones por fecha") already implies. It is NOT a
+               "when did this ad start" filter — do not use it to mean that. Ignored if not
+               a valid YYYY-MM-DD string.
+        delivery_date_max: ISO date (YYYY-MM-DD), optional. Paired with delivery_date_min;
+               either may be passed alone.
         wait_seconds: how long to let the SPA hydrate before scraping (raise if results are
                empty). Capped at 30s.
         scroll_rounds: infinite-scroll cycles to load more ads past the first ~24
@@ -582,6 +600,10 @@ def search_ad_library(
     if sort_recent:
         params.append(("sort_data[mode]", "relevancy_monthly_grouped"))
         params.append(("sort_data[direction]", "desc"))
+    if delivery_date_min and _ISO_DATE_RE.match(delivery_date_min):
+        params.append(("start_date[min]", delivery_date_min))
+    if delivery_date_max and _ISO_DATE_RE.match(delivery_date_max):
+        params.append(("start_date[max]", delivery_date_max))
     url = AD_LIBRARY_BASE + "?" + "&".join(f"{quote(k)}={quote(str(v))}" for k, v in params)
 
     cid = _correlation_id()
